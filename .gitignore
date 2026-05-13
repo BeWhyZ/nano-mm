@@ -93,9 +93,9 @@ logs/
 *.csv
 *.parquet
 *.feather
-data/raw/
-data/cache/
 
 # Runtime
 *.pid
 *.sock
+
+etc/
