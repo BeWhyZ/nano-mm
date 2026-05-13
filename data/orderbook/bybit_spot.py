@@ -24,10 +24,9 @@ import websockets.exceptions
 from biz.domain.book import OrderBookSnapshot
 from biz.repo.orderbook import OrderBookRepo
 from data.orderbook.base import LocalOrderBook
-from pkg import metrics
+from pkg import exapi, metrics
 from pkg.symbol import bybit_spot_into_external
 
-_WS_URL = "wss://stream.bybit.com/v5/public/spot"
 _HEARTBEAT_TIMEOUT = 3.0
 _PING_INTERVAL = 20.0
 _MAX_BACKOFF = 5.0
@@ -46,6 +45,8 @@ class BybitSpotOrderBookTracker(OrderBookRepo):
         depth: int = 50,
         on_update: Callable[[OrderBookSnapshot], None] | None = None,
         top_k: int = 20,
+        testnet: bool = False,
+        proxy: str | None = None,
     ) -> None:
         self._symbol = symbol.upper()                         # internal: BTC_USDT
         self._ext_symbol = bybit_spot_into_external(symbol)  # wire: BTCUSDT
@@ -53,6 +54,9 @@ class BybitSpotOrderBookTracker(OrderBookRepo):
         self._depth = depth
         self._on_update = on_update
         self._top_k = top_k
+        self._proxy = proxy
+        api = exapi.BYBIT_SPOT
+        self._ws_url = api.ws_testnet if testnet else api.ws
         self._book = LocalOrderBook(self._symbol, "bybit_spot")
         self._stop = asyncio.Event()
 
@@ -101,7 +105,9 @@ class BybitSpotOrderBookTracker(OrderBookRepo):
     # ------------------------------------------------------------------
 
     async def _run_session(self) -> None:
-        async with websockets.connect(_WS_URL, ping_interval=None) as ws:
+        async with websockets.connect(
+            self._ws_url, ping_interval=None, proxy=self._proxy,
+        ) as ws:
             # Subscribe
             sub_msg = json.dumps({
                 "op": "subscribe",

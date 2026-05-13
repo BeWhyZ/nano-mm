@@ -21,8 +21,16 @@ class LogConfig(msgspec.Struct, frozen=True):
     dir: str = "log"
 
 
+class NetConfig(msgspec.Struct, frozen=True):
+    # HTTP(S) proxy URL applied to both REST and WS clients.
+    # Use http://host:port even for SOCKS-capable local proxies (e.g. Clash mixed-port)
+    # to avoid the python-socks dependency.
+    http_proxy: str | None = None
+
+
 class Config(msgspec.Struct, frozen=True):
     log: LogConfig = msgspec.field(default_factory=LogConfig)
+    net: NetConfig = msgspec.field(default_factory=NetConfig)
 
 
 def load(path: str | Path = "etc/nano-mm.yaml") -> Config:

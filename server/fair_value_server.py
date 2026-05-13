@@ -31,6 +31,7 @@ class FairValueServer:
         on_state: Callable[[FairPriceState], None],
         lg: structlog.stdlib.BoundLogger,
         micro_k: int = 5,
+        proxy: str | None = None,
     ) -> None:
         self.lg = lg.bind(component="fair_value_server", symbol=symbol.upper())
         self._engine = FairValueEngine(symbol, lg=self.lg, micro_k=micro_k)
@@ -40,6 +41,7 @@ class FairValueServer:
             session=session,
             lg=self.lg,
             on_update=self._on_update,
+            proxy=proxy,
         )
 
     def _on_update(self, snap: OrderBookSnapshot) -> None:

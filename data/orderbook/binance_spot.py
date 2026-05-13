@@ -24,11 +24,9 @@ import websockets.exceptions
 from biz.domain.book import OrderBookSnapshot
 from biz.repo.orderbook import OrderBookRepo
 from data.orderbook.base import LocalOrderBook
-from pkg import metrics
+from pkg import exapi, metrics
 from pkg.symbol import binance_spot_into_external
 
-_WS_BASE = "wss://stream.binance.com:9443/stream"
-_SNAPSHOT_URL = "https://api.binance.com/api/v3/depth"
 _HEARTBEAT_TIMEOUT = 3.0   # s: no message → assume dead
 _SNAPSHOT_LIMIT = 1000     # REST snapshot depth
 _MAX_BACKOFF = 5.0         # s
@@ -47,6 +45,8 @@ class BinanceSpotOrderBookTracker(OrderBookRepo):
         lg: structlog.stdlib.BoundLogger,
         on_update: Callable[[OrderBookSnapshot], None] | None = None,
         top_k: int = 20,
+        testnet: bool = False,
+        proxy: str | None = None,
     ) -> None:
         self._symbol = symbol.upper()                          # internal: BTC_USDT
         self._ext_symbol = binance_spot_into_external(symbol)  # wire: BTCUSDT
@@ -54,6 +54,10 @@ class BinanceSpotOrderBookTracker(OrderBookRepo):
         self._session = session
         self._on_update = on_update
         self._top_k = top_k
+        self._proxy = proxy
+        api = exapi.BINANCE_SPOT
+        self._rest_url = api.rest_testnet if testnet else api.rest
+        self._ws_url = api.ws_testnet if testnet else api.ws
         self._book = LocalOrderBook(self._symbol, "binance_spot")
         self._stop = asyncio.Event()
 
@@ -107,10 +111,12 @@ class BinanceSpotOrderBookTracker(OrderBookRepo):
     # ------------------------------------------------------------------
 
     async def _run_session(self) -> None:
-        ws_url = f"{_WS_BASE}?streams={self._ext_symbol.lower()}@depth@100ms"
+        ws_url = f"{self._ws_url}?streams={self._ext_symbol.lower()}@depth@100ms"
         buffer: list[dict[str, Any]] = []
 
-        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+        async with websockets.connect(
+            ws_url, ping_interval=20, ping_timeout=10, proxy=self._proxy,
+        ) as ws:
             # Phase 1: buffer events AND fetch snapshot concurrently
             snapshot_task = asyncio.create_task(self._fetch_snapshot())
             try:
@@ -195,9 +201,9 @@ class BinanceSpotOrderBookTracker(OrderBookRepo):
 
     async def _fetch_snapshot(self) -> dict[str, Any]:
         params = {"symbol": self._ext_symbol, "limit": _SNAPSHOT_LIMIT}
-        async with self._session.get(_SNAPSHOT_URL, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        return await exapi.get(
+            self._session, self._rest_url, "/api/v3/depth", params, proxy=self._proxy,
+        )
 
     def _parse_stream(self, raw: str | bytes) -> dict[str, Any] | None:
         import json

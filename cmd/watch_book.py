@@ -13,6 +13,7 @@ import sys
 
 import aiohttp
 
+import config
 from biz.usecase.fair_value import FairPriceState
 from pkg import logger
 from server.fair_value_server import FairValueServer
@@ -35,11 +36,14 @@ def _print_state(s: FairPriceState) -> None:
 
 
 async def main(symbol: str) -> None:
-    logger.configure(level="WARNING")
+    cfg = config.load()
+    logger.configure(level=cfg.log.level, log_dir=cfg.log.dir)
     lg = logger.get_logger("watch_book")
     print(f"Watching {symbol} — Ctrl-C to stop")
     async with aiohttp.ClientSession() as session:
-        server = FairValueServer(symbol, session, on_state=_print_state, lg=lg)
+        server = FairValueServer(
+            symbol, session, on_state=_print_state, lg=lg, proxy=cfg.net.http_proxy,
+        )
         try:
             await server.run()
         except asyncio.CancelledError:
