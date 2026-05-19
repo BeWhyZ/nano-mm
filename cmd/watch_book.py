@@ -10,16 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import Any
 
 import aiohttp
 
 import config
-from biz.usecase.fair_value import FairPriceState
 from pkg import logger
 from server.fair_value_server import FairValueServer
 
 
-def _print_state(s: FairPriceState) -> None:
+def _print_state(s: Any) -> None:
     bar_len = 20
     pos = int((s.obi + 1.0) / 2.0 * bar_len)
     bar = "[" + "-" * pos + "|" + "-" * (bar_len - pos) + "]"
@@ -39,10 +39,17 @@ async def main(symbol: str) -> None:
     cfg = config.load()
     logger.configure(level=cfg.log.level, log_dir=cfg.log.dir)
     lg = logger.get_logger("watch_book")
-    print(f"Watching {symbol} — Ctrl-C to stop")
+
+    print(f"Watching {symbol} -- Ctrl-C to stop")
+
     async with aiohttp.ClientSession() as session:
         server = FairValueServer(
-            symbol, session, on_state=_print_state, lg=lg, proxy=cfg.net.http_proxy,
+            symbol=symbol,
+            session=session,
+            on_state=_print_state,
+            cfg=cfg,
+            lg=lg,
+            proxy=cfg.net.http_proxy,
         )
         try:
             await server.run()

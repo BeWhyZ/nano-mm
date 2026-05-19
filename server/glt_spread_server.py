@@ -1,28 +1,31 @@
 """
-GltSpreadServer: wires book tracker + aggTrade tracker + GLT engine.
+GltSpreadServer: wires FairValueService (shared book feed) + aggTrade tracker + GLT engine.
+
+The book subscription is owned by FairValueService — this server registers a listener
+rather than opening a duplicate WebSocket. Only the trade tracker is owned here.
 
 Usage:
-    server = GltSpreadServer(symbol, session, cfg, on_state=cb, lg=lg)
-    await server.run()
+    fair_svc = FairValueService(symbol, [Exchange.BINANCE_SPOT], session, cfg.pricing_engine, lg)
+    server = GltSpreadServer(symbol, fair_svc, cfg.spread_engine, on_state=cb, lg=lg)
+    await asyncio.gather(fair_svc.run(), server.run())
 
-`on_state` fires on every L2 tick that yields a QuoteState (i.e. always once
-the book is synced; bid/ask may be None during calibration warmup).
+`on_state` fires on every L2 tick that yields a QuoteState (bid/ask may be None during
+calibration warmup of ~30–60 s).
 """
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 
-import aiohttp
 import structlog
 
 from biz.domain.book import OrderBookSnapshot
 from biz.domain.quote import QuoteState
 from biz.domain.trade import TradeTick
+from biz.repo.trade import make_trade_tracker
 from biz.usecase.glt_spread import GltSpreadEngine
 from config import SpreadConfig
-from data.orderbook.binance_spot import BinanceSpotOrderBookTracker
-from data.trade.binance_spot import BinanceSpotAggTradeTracker
+from pkg.constant import Exchange
+from service.fair_value_service import FairValueService
 
 
 class GltSpreadServer:
@@ -30,21 +33,22 @@ class GltSpreadServer:
     def __init__(
         self,
         symbol: str,
-        session: aiohttp.ClientSession,
+        fair_value_svc: FairValueService,
         cfg: SpreadConfig,
         on_state: Callable[[QuoteState], None],
         lg: structlog.stdlib.BoundLogger,
+        exchange: Exchange = Exchange.BINANCE_SPOT,
         proxy: str | None = None,
     ) -> None:
         self.lg = lg.bind(component="glt_spread_server", symbol=symbol.upper())
         self._engine = GltSpreadEngine(symbol, cfg, lg=self.lg)
         self._on_state = on_state
-        self._book = BinanceSpotOrderBookTracker(
-            symbol=symbol, session=session, lg=self.lg,
-            on_update=self._on_book, proxy=proxy,
-        )
-        self._trade = BinanceSpotAggTradeTracker(
-            symbol=symbol, lg=self.lg, on_trade=self._on_trade, proxy=proxy,
+
+        # Register book listener on primary exchange — avoids a duplicate subscription
+        fair_value_svc.register_book_listener(exchange, self._on_book)
+
+        self._trade = make_trade_tracker(
+            exchange=exchange, symbol=symbol, on_trade=self._on_trade, lg=self.lg, proxy=proxy,
         )
 
     def set_inventory(self, q_norm: float) -> None:
@@ -61,5 +65,6 @@ class GltSpreadServer:
         self._engine.on_trade(tick)
 
     async def run(self) -> None:
+        """Run the trade tracker. Book lifecycle is owned by FairValueService."""
         self.lg.info("glt_spread_server_start")
-        await asyncio.gather(self._book.run(), self._trade.run())
+        await self._trade.run()

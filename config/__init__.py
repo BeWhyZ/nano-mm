@@ -31,6 +31,8 @@ class NetConfig(msgspec.Struct, frozen=True):
 class PricingConfig(msgspec.Struct, frozen=True):
     # Depth-decay factor for micro-price imbalance weighting
     micro_k: float = 5.0
+    # When true, cmd.mm skips the MM engine and shows a raw L2 orderbook view instead.
+    debug: bool = False
 
 
 class SpreadConfig(msgspec.Struct, frozen=True):
