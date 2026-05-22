@@ -17,8 +17,11 @@ class QuoteState(NamedTuple):
     symbol: str
     venue: str
     mid: float
-    bid: Quote | None       # None when calibration not ready or hard cap stopped this side
-    ask: Quote | None
+    # Empty tuple = calibration not ready or hard cap stopped this side.
+    # Ordered inner-most first: bids[0] closest to mid (highest price),
+    # asks[0] closest to mid (lowest price). Strictly monotonic in price.
+    bids: tuple[Quote, ...]
+    asks: tuple[Quote, ...]
     sigma: float            # price · sec^(-1/2)
     A: float                # trades · sec^(-1)
     k: float                # 1 / price

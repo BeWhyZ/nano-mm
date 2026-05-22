@@ -88,7 +88,7 @@ config/local*.yaml
 config/local*.json
 
 # Logs & data
-logs/
+log/
 *.log
 *.csv
 *.parquet

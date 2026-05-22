@@ -68,7 +68,7 @@ _SHARED_PROCESSORS: list[Any] = [
 
 def configure(
     level: str = "INFO",
-    log_dir: str | Path = "log",
+    log_dir: str | Path = "logs",
 ) -> None:
     """Wire up structlog → stdlib → QueueHandler → QueueListener → [file, console].
 

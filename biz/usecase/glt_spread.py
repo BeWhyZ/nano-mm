@@ -7,8 +7,12 @@ Three event entry points:
     on_inventory(q_norm) — set normalized inventory in [-1, 1]
 
 `state` property returns the latest QuoteState, or None until first valid
-snapshot. When σ or (A, k) are not yet calibrated, state.bid and state.ask
-are None (engine declines to quote — Phase-1 cold-start discipline).
+snapshot. When σ or (A, k) are not yet calibrated, state.bids and state.asks
+are empty tuples (engine declines to quote — Phase-1 cold-start discipline).
+
+GLT gives the inner-most (δ_b, δ_a); the ladder module expands those into
+N levels per side using the dispersion unit u. Tick rounding then enforces
+strict price monotonicity so no two levels collide on the same tick.
 
 The engine is stateless w.r.t. exchange I/O — caller is responsible for
 turning Quote into actual orders.
@@ -24,7 +28,15 @@ from biz.domain.order import OrderSide
 from biz.domain.quote import Quote, QuoteState
 from biz.domain.trade import TradeTick
 from config import SpreadConfig
-from pkg.quant import GLTParams, IntensityCalibrator, RollingRealizedVol, quotes
+from pkg.quant import (
+    GLTParams,
+    IntensityCalibrator,
+    LadderConfig,
+    RollingRealizedVol,
+    build_ladder,
+    inventory_skew_unit,
+    quotes,
+)
 
 
 class GltSpreadEngine:
@@ -47,6 +59,12 @@ class GltSpreadEngine:
             window_sec=cfg.intensity_window_sec,
             min_trades=cfg.intensity_min_trades,
             min_filled_bins=cfg.intensity_min_filled_bins,
+        )
+        self._ladder_cfg = LadderConfig(
+            n_levels=cfg.ladder_n_levels,
+            delta_coef=cfg.ladder_delta_coef,
+            weights=tuple(cfg.ladder_weights),
+            n_shrink=cfg.ladder_n_shrink,
         )
         self._q_norm: float = 0.0
         self._latest_mid: float | None = None
@@ -102,18 +120,11 @@ class GltSpreadEngine:
         intens = self._intensity.params
 
         if sigma is None or intens is None:
-            self._state = QuoteState(
-                symbol=self._symbol,
-                venue=venue,
-                mid=mid,
-                bid=None,
-                ask=None,
+            self._state = self._empty_state(
+                venue, mid, ts_ns,
                 sigma=sigma or 0.0,
                 A=(intens[0] if intens else 0.0),
                 k=(intens[1] if intens else 0.0),
-                gamma=self._cfg.gamma,
-                q_norm=self._q_norm,
-                ts_ns=ts_ns,
             )
             return
 
@@ -122,16 +133,12 @@ class GltSpreadEngine:
             params = GLTParams(gamma=self._cfg.gamma, sigma=sigma, A=A, k=k)
         except ValueError as exc:
             self.lg.warning("glt_params_invalid", error=str(exc), sigma=sigma, A=A, k=k)
-            self._state = QuoteState(
-                symbol=self._symbol, venue=venue, mid=mid,
-                bid=None, ask=None,
-                sigma=sigma, A=A, k=k, gamma=self._cfg.gamma,
-                q_norm=self._q_norm, ts_ns=ts_ns,
-            )
+            self._state = self._empty_state(venue, mid, ts_ns, sigma=sigma, A=A, k=k)
             return
 
         q_lot = self._q_norm * self._cfg.Q_max
         delta_b, delta_a = quotes(params, q_lot)
+        u = inventory_skew_unit(params)
 
         # Negative δ means the model wants to cross — a sign that γ/Q_max are
         # mis-tuned for current σ. Suppress the offending side and log; the
@@ -143,36 +150,36 @@ class GltSpreadEngine:
                 sigma=sigma, A=A, k=k, q_norm=self._q_norm,
             )
 
-        bid_px = mid - delta_b
-        ask_px = mid + delta_a
-        if self._cfg.price_tick > 0.0:
-            bid_px = _round_down(bid_px, self._cfg.price_tick)
-            ask_px = _round_up(ask_px, self._cfg.price_tick)
+        bid_levels, ask_levels = build_ladder(
+            delta_b=delta_b,
+            delta_a=delta_a,
+            u=u,
+            q_norm=self._q_norm,
+            cfg=self._ladder_cfg,
+        )
 
         taper = max(0.0, 1.0 - abs(self._q_norm))
         base_size = self._cfg.lot_size * taper
 
         # Hard cap: stop adding to inventory once at cap.
-        bid_size = base_size if self._q_norm < self._cfg.q_hard_cap else 0.0
-        ask_size = base_size if self._q_norm > -self._cfg.q_hard_cap else 0.0
+        bid_active = self._q_norm < self._cfg.q_hard_cap and delta_b >= 0.0 and base_size > 0.0
+        ask_active = self._q_norm > -self._cfg.q_hard_cap and delta_a >= 0.0 and base_size > 0.0
 
-        bid = (
-            Quote(side=OrderSide.BUY, price=bid_px, size=bid_size)
-            if bid_size > 0.0 and delta_b >= 0.0
-            else None
+        bids = (
+            self._build_bid_quotes(mid, bid_levels, base_size)
+            if bid_active else ()
         )
-        ask = (
-            Quote(side=OrderSide.SELL, price=ask_px, size=ask_size)
-            if ask_size > 0.0 and delta_a >= 0.0
-            else None
+        asks = (
+            self._build_ask_quotes(mid, ask_levels, base_size)
+            if ask_active else ()
         )
 
         self._state = QuoteState(
             symbol=self._symbol,
             venue=venue,
             mid=mid,
-            bid=bid,
-            ask=ask,
+            bids=bids,
+            asks=asks,
             sigma=sigma,
             A=A,
             k=k,
@@ -186,15 +193,65 @@ class GltSpreadEngine:
             mid=round(mid, 4),
             delta_b=round(delta_b, 4),
             delta_a=round(delta_a, 4),
-            bid_px=round(bid_px, 4) if bid else None,
-            ask_px=round(ask_px, 4) if ask else None,
-            bid_size=bid_size,
-            ask_size=ask_size,
+            u=round(u, 6),
+            n_bids=len(bids),
+            n_asks=len(asks),
             sigma=round(sigma, 6),
             A=round(A, 3),
             k=round(k, 6),
             q_norm=round(self._q_norm, 3),
         )
+
+    def _empty_state(
+        self, venue: str, mid: float, ts_ns: int,
+        sigma: float, A: float, k: float,
+    ) -> QuoteState:
+        return QuoteState(
+            symbol=self._symbol, venue=venue, mid=mid,
+            bids=(), asks=(),
+            sigma=sigma, A=A, k=k, gamma=self._cfg.gamma,
+            q_norm=self._q_norm, ts_ns=ts_ns,
+        )
+
+    def _build_bid_quotes(
+        self, mid: float, levels, base_size: float,
+    ) -> tuple[Quote, ...]:
+        # Bid prices = mid - delta, monotonically decreasing in level index.
+        tick = self._cfg.price_tick
+        out: list[Quote] = []
+        prev_px: float | None = None
+        for lv in levels:
+            raw_px = mid - lv.delta_from_mid
+            px = _round_down(raw_px, tick) if tick > 0.0 else raw_px
+            # Enforce strict monotonicity after rounding.
+            if prev_px is not None and px >= prev_px:
+                px = prev_px - tick if tick > 0.0 else prev_px - 1e-12
+            if px <= 0.0:
+                continue
+            size = base_size * lv.size_weight
+            if size <= 0.0:
+                continue
+            out.append(Quote(side=OrderSide.BUY, price=px, size=size))
+            prev_px = px
+        return tuple(out)
+
+    def _build_ask_quotes(
+        self, mid: float, levels, base_size: float,
+    ) -> tuple[Quote, ...]:
+        tick = self._cfg.price_tick
+        out: list[Quote] = []
+        prev_px: float | None = None
+        for lv in levels:
+            raw_px = mid + lv.delta_from_mid
+            px = _round_up(raw_px, tick) if tick > 0.0 else raw_px
+            if prev_px is not None and px <= prev_px:
+                px = prev_px + tick if tick > 0.0 else prev_px + 1e-12
+            size = base_size * lv.size_weight
+            if size <= 0.0:
+                continue
+            out.append(Quote(side=OrderSide.SELL, price=px, size=size))
+            prev_px = px
+        return tuple(out)
 
 
 def _round_down(x: float, tick: float) -> float:

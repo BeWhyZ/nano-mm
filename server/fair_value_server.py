@@ -1,8 +1,8 @@
 """
-FairValueServer: wires BinanceSpotOrderBookTracker → FairValueEngine.
+FairValueServer: thin orchestrator around FairValueService.
 
 Usage:
-    server = FairValueServer(symbol, session, on_state=my_callback)
+    server = FairValueServer(symbol, session, on_state=my_callback, cfg=cfg, lg=lg)
     await server.run()
 """
 from __future__ import annotations
@@ -12,14 +12,15 @@ from collections.abc import Callable
 import aiohttp
 import structlog
 
-from biz.domain.book import OrderBookSnapshot
-from biz.usecase.fair_value import FairPriceState, FairValueEngine
-from data.orderbook.binance_spot import BinanceSpotOrderBookTracker
+from biz.usecase.fair_value import FairPriceState
+from config import Config
+from pkg.constant import Exchange
+from service.fair_value_service import FairValueService
 
 
 class FairValueServer:
     """
-    Composes the orderbook tracker and fair-value usecase into a runnable unit.
+    Wires FairValueService with an on_state callback for each book tick.
 
     on_state fires on every tick that produces a valid FairPriceState.
     """
@@ -29,27 +30,35 @@ class FairValueServer:
         symbol: str,
         session: aiohttp.ClientSession,
         on_state: Callable[[FairPriceState], None],
+        cfg: Config,
         lg: structlog.stdlib.BoundLogger,
-        micro_k: int = 5,
+        exchanges: list[Exchange] | None = None,
         proxy: str | None = None,
     ) -> None:
         self.lg = lg.bind(component="fair_value_server", symbol=symbol.upper())
-        self._engine = FairValueEngine(symbol, lg=self.lg, micro_k=micro_k)
-        self._on_state = on_state
-        self._tracker = BinanceSpotOrderBookTracker(
+        _exchanges = exchanges or [Exchange.BINANCE_SPOT]
+        self._svc = FairValueService(
             symbol=symbol,
+            exchanges=_exchanges,
             session=session,
+            cfg=cfg.pricing_engine,
             lg=self.lg,
-            on_update=self._on_update,
             proxy=proxy,
         )
+        # Register the on_state callback as a book listener on every exchange
+        for ex in _exchanges:
+            self._svc.register_book_listener(ex, self._make_listener(ex, on_state))
 
-    def _on_update(self, snap: OrderBookSnapshot) -> None:
-        self._engine.on_tick(snap)
-        state = self._engine.state
-        if state is not None:
-            self._on_state(state)
+    def _make_listener(
+        self, exchange: Exchange, on_state: Callable[[FairPriceState], None]
+    ) -> Callable[[object], None]:
+        def _listener(_snap: object) -> None:
+            state = self._svc.get_fair_price(exchange)
+            if state is not None:
+                on_state(state)
+
+        return _listener
 
     async def run(self) -> None:
         self.lg.info("fair_value_server_start")
-        await self._tracker.run()
+        await self._svc.run()

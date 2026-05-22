@@ -4,11 +4,16 @@
 
 ```
 cmd/
-├── main.go / main.py        # 程序唯一入口，组装依赖并启动
+├── mm.py                    # 程序唯一入口，只读配置、创建 server、调 run()
 
 server/
-├── server.py                # 服务生命周期管理（启动/停止/信号处理）
-├── handler/                 # 外部触发入口（WebSocket handler、REST、定时任务等）
+├── mm_server.py             # 完整做市服务：内部创建并连线所有 service
+├── fair_value_server.py     # 公平价服务（debug 用：watch_book）
+├── glt_spread_server.py     # GLT 报价服务（内部持有 FairValueService）
+
+service/
+├── fair_value_service.py    # API 定义：get_fair_price() / register_book_listener()
+│                            # 内部：持有 data 层 trackers + biz/usecase/FairValueEngine
 
 biz/
 ├── usecase/                 # 业务逻辑对象（UseCase），核心做市逻辑在此
@@ -16,189 +21,160 @@ biz/
 └── domain/                  # 领域模型、值对象
 
 data/
-├── orderbook/               # 实现 biz/repo 中定义的 OrderBookRepo
+├── orderbook/               # 实现 OrderBookRepo（BinanceSpot、BybitSpot + 工厂函数）
 ├── exchange/                # 实现 ExchangeRepo（下单、查仓位）
-└── cache/                   # 实现 CacheRepo（本地状态缓存）
+└── trade/                   # 实现 TradeStreamRepo（aggTrade 流）
 
 pkg/
 ├── logger/                  # 日志
-├── config/                  # 配置加载
+├── constant/                # Exchange 枚举、ExchangeApi 常量
 ├── metrics/                 # 监控埋点
-└── math/                    # 公共数学工具（滚动统计、GLT 公式等）
+└── quant/                   # 公共数学工具（RollingVol、GLT 公式、IntensityCalibrator）
 ```
 
 ## 调用链
 
 ```
 cmd
- └─► server.New(...)          # 注入所有依赖，启动事件循环
-      └─► biz.NewUseCase(...) # 接收 Repo 接口，执行做市逻辑
-           └─► data.NewXxxRepo(...)  # 实现 Repo 接口，对接交易所/本地状态
+ └─► server.MMServer(cfg, session, ...)   # 组装所有层，创建并注入 data 依赖
+      │    ├─► data.make_orderbook_tracker(exchange, ...)  # 具体 WS 连接（在此创建）
+      │    └─► data.BinanceSpotAggTradeTracker(...)        # 成交流（在此创建）
+      │
+      └─► service.FairValueService(book_repos, ...)   # 只持有 biz 层对象
+      │    └─► biz.FairValueEngine(book_repo, ...)    # 公平价计算（接受 OrderBookRepo 接口）
+      │
+      └─► server.GltSpreadServer(fair_svc, agg_trade_repo, ...)
+           └─► fair_svc.register_book_listener(...)        # 复用已有订阅
+           └─► biz.GltSpreadEngine(agg_trade_repo, ...)    # GLT 报价计算（接受 AggTradeRepo 接口）
 ```
 
 ---
 
 ## 各层职责
 
-### `cmd` — 入口与依赖组装
+### `cmd` — 入口，只做"启动"
 
-- 唯一负责读取配置、实例化所有对象、注入依赖。
-- **不含任何业务逻辑**，只做"连线"。
+- 读取配置、初始化日志、创建 aiohttp session。
+- **只** import `server` 层，创建 server 对象后调用 `run()`。
+- 不感知任何 service / biz / data 细节。
 
 ```python
-# cmd/main.py
-def main():
-    cfg = config.load("config.toml")
-
-    # data 层
-    ob_repo   = data.OrderBookRepo(cfg.exchange)
-    exch_repo = data.ExchangeRepo(cfg.exchange)
-
-    # biz 层
-    uc = biz.MarketMakingUseCase(
-        ob_repo=ob_repo,
-        exch_repo=exch_repo,
-        cfg=cfg.strategy,
-    )
-
-    # server 层
-    srv = server.Server(usecase=uc, cfg=cfg.server)
-    srv.run()
+# cmd/mm.py
+async def main(symbol: str) -> None:
+    cfg = config.load()
+    async with aiohttp.ClientSession() as session:
+        srv = MMServer(symbol, session, cfg, on_quote=_on_quote, lg=lg)
+        await srv.run()
 ```
 
 ---
 
-### `server` — 生命周期管理
+### `server` — 生命周期管理 + 依赖组装根
 
-- 负责启动 WebSocket 连接、注册信号处理（SIGTERM/SIGINT）、优雅退出。
-- 将外部事件（行情推送、成交回报）路由到 UseCase 的对应方法。
-- **不含定价或风控逻辑**。
+- 负责**创建 data 层对象**，将其注入 service/biz 层，启动所有异步任务，处理 SIGTERM/Ctrl-C。
+- 是整个系统的**组合根（composition root）**：唯一知道"用哪个具体 data 实现"的地方。
+- **不含**定价、风控、业务决策逻辑。
+- 可以 import `service` 和 `data`，不应直接 import `biz/usecase`。
 
 ```python
-# server/server.py
-class Server:
-    def __init__(self, usecase: biz.MarketMakingUseCase, cfg: ServerConfig):
-        self._uc  = usecase
-        self._cfg = cfg
+# server/mm_server.py
+class MMServer:
+    def __init__(self, symbol, session, cfg, on_quote, lg, ...):
+        # 在 server 层创建 data 对象，向下注入
+        book_repos = {ex: make_orderbook_tracker(ex, symbol, session) for ex in exchanges}
+        agg_trade_repo = BinanceSpotAggTradeTracker(symbol, session)
 
-    async def run(self):
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._stream_orderbook())
-            tg.create_task(self._stream_fills())
-            tg.create_task(self._quote_loop())
+        self._fair_svc = FairValueService(symbol, book_repos, cfg.pricing_engine, lg)
+        self._glt = GltSpreadServer(symbol, self._fair_svc, agg_trade_repo, cfg.spread_engine, on_quote, lg)
 
-    async def _stream_orderbook(self):
-        async for snap in self._cfg.ws.subscribe_orderbook():
-            await self._uc.on_orderbook(snap)
+    async def run(self) -> None:
+        await asyncio.gather(self._fair_svc.run(), self._glt.run())
 ```
 
 ---
 
-### `biz` — 业务逻辑层（核心）
+### `service` — API 定义层
 
-#### UseCase 对象
-
-- 持有所有 Repo 接口（依赖抽象，不依赖具体实现）。
-- 实现做市核心流程：公平价值计算 → 价差定价 → 报价管理 → 库存对冲。
-
-```python
-# biz/usecase/market_making.py
-class MarketMakingUseCase:
-    def __init__(
-        self,
-        ob_repo:   OrderBookRepo,
-        exch_repo: ExchangeRepo,
-        cfg:       StrategyConfig,
-    ):
-        self._ob   = ob_repo
-        self._exch = exch_repo
-        self._cfg  = cfg
-
-    async def on_orderbook(self, snap: OrderBookSnapshot) -> None:
-        mid   = self._ob.mid_price(snap)
-        spread, skew = self._pricing_engine.quote(mid, self._inventory())
-        await self._exch.replace_quotes(bid=mid - spread/2 + skew,
-                                         ask=mid + spread/2 + skew)
-```
-
-#### Repo 接口定义
-
-- **接口定义在 biz 层**，data 层负责实现，biz 层永远不 import data。
+- **对外**：定义稳定的业务接口（如 `get_fair_price()`），供 server 层消费。
+- **对内**：**只调用 `biz/usecase`**，不直接 import 或创建任何 `data` 层对象。
+- 接收的 data 依赖已由 server 层创建并注入（类型为 `biz/repo` 中定义的抽象接口）。
 
 ```python
-# biz/repo/orderbook.py
-from abc import ABC, abstractmethod
+# service/fair_value_service.py
+class FairValueService:
+    """
+    对外接口：
+      get_fair_price(exchange?)             -> FairPriceState | None
+      register_book_listener(exchange, cb)  供 GLT 等复用订阅，避免重复 WS 连接
 
-class OrderBookRepo(ABC):
-    @abstractmethod
-    def mid_price(self, snap: OrderBookSnapshot) -> float: ...
-
-    @abstractmethod
-    def best_bid_ask(self, snap: OrderBookSnapshot) -> tuple[float, float]: ...
-
-# biz/repo/exchange.py
-class ExchangeRepo(ABC):
-    @abstractmethod
-    async def replace_quotes(self, bid: float, ask: float) -> None: ...
-
-    @abstractmethod
-    async def get_position(self, symbol: str) -> Position: ...
+    内部：
+      接收 book_repos: dict[Exchange, OrderBookRepo]（由 server 注入）
+      为每个 exchange 创建 FairValueEngine(biz/usecase)，将 repo 传入
+      WS 回调 -> engine.on_tick() -> 通知所有 listener
+    """
+    def __init__(self, symbol, book_repos: dict[Exchange, OrderBookRepo], cfg, lg): ...
+    def get_fair_price(self, exchange=None) -> FairPriceState | None: ...
+    def register_book_listener(self, exchange, cb) -> None: ...
+    async def run(self) -> None: ...
 ```
 
 ---
 
-### `data` — 接口实现层
+### `biz` — 业务逻辑层（核心，不感知外部世界）
+
+- `usecase/`：持有 Repo 接口，执行做市核心流程（公平价计算、GLT 定价）。
+- `repo/`：接口定义在 `biz` 层，`data` 层负责实现，`biz` 永远不 import `data`。
+- `domain/`：领域模型、值对象（OrderBookSnapshot、TradeTick、QuoteState…）。
+
+```python
+# biz/usecase/fair_value.py
+class FairValueEngine:
+    def on_tick(self, snap: OrderBookSnapshot) -> None: ...
+    @property
+    def state(self) -> FairPriceState | None: ...
+
+# biz/usecase/glt_spread.py
+class GltSpreadEngine:
+    def on_book(self, snap: OrderBookSnapshot) -> None: ...
+    def on_trade(self, tick: TradeTick) -> None: ...
+    def on_inventory(self, q_norm: float) -> None: ...
+    @property
+    def state(self) -> QuoteState | None: ...
+```
+
+---
+
+### `data` — Repo 实现层
 
 - 实现 `biz/repo` 中定义的所有抽象接口。
-- 对接交易所 REST/WebSocket API、本地 Redis/内存缓存。
+- 对接交易所 REST / WebSocket API。
 - **不含任何定价或策略逻辑**。
-
-```python
-# data/exchange/binance.py
-from biz.repo.exchange import ExchangeRepo
-
-class BinanceExchangeRepo(ExchangeRepo):
-    def __init__(self, client: BinanceClient):
-        self._client = client          # 构造函数注入，方便 mock
-
-    async def replace_quotes(self, bid: float, ask: float) -> None:
-        await self._client.cancel_all()
-        await self._client.place_limit(side="buy",  price=bid)
-        await self._client.place_limit(side="sell", price=ask)
-
-    async def get_position(self, symbol: str) -> Position:
-        raw = await self._client.get_position(symbol)
-        return Position(symbol=symbol, qty=raw["positionAmt"])
-```
+- `data/orderbook/__init__.py` 提供工厂函数 `make_orderbook_tracker(exchange, ...)` 将 `Exchange` 枚举映射到具体 tracker。
 
 ---
 
 ### `pkg` — 公共工具包
 
 - **无业务语义**，任何层都可以 import。
-- 典型内容：滚动统计（`RollingVol`）、GLT 公式、日志封装、配置 schema。
-
-```python
-# pkg/math/rolling.py
-class RollingVol:
-    """Welford online variance, O(1) per update."""
-    def __init__(self, window: int): ...
-    def update(self, price: float) -> None: ...
-    def sigma(self) -> float: ...       # annualized vol
-```
+- `pkg/constant/`：`Exchange(StrEnum)` 枚举 + `ExchangeApi` 常量（REST/WS URL）。
+- `pkg/quant/`：GLT 公式、RollingRealizedVol、IntensityCalibrator。
 
 ---
 
 ## 依赖方向约束
 
 ```
-cmd  ──imports──►  server, biz, data, pkg
-server  ────────►  biz, pkg
-biz     ────────►  pkg          # 严禁 import data
-data    ────────►  biz/repo, pkg
+cmd      ──────────►  server, pkg
+server   ──────────►  service, data, pkg   # 唯一可以 import data 的上层
+service  ──────────►  biz, pkg             # 严禁直接 import data
+data     ──────────►  biz/repo, pkg
+biz      ──────────►  pkg                  # 严禁 import data
 ```
 
-> **核心约束**：`biz` 永远不 import `data`，只依赖自己定义的抽象接口。这是保证可测试性和可替换性的根本。
+> **核心约束一**：`biz` 永远不 import `data`，只依赖自己定义的抽象接口。
+> **核心约束二**：`service` 永远不 import `data`，所需的 data 对象由 `server` 创建后以 `biz/repo` 接口类型注入。
+> **核心约束三**：`cmd` 永远不 import `service`、`biz`、`data`，只调用 `server`。
+> `server` 是系统的组合根（composition root），是唯一知道具体 data 实现的地方。
 
 ---
 
@@ -208,16 +184,16 @@ data    ────────►  biz/repo, pkg
 
 ```python
 # 正确：依赖从外部注入
-class MarketMakingUseCase:
-    def __init__(self, ob_repo: OrderBookRepo, exch_repo: ExchangeRepo): ...
+class GltSpreadEngine:
+    def __init__(self, symbol: str, cfg: SpreadConfig, lg: BoundLogger): ...
 
 # 错误：内部硬编码依赖
-class MarketMakingUseCase:
+class GltSpreadEngine:
     def __init__(self):
-        self._exch = BinanceExchangeRepo(BinanceClient(...))  # 不可测试
+        self._vol = RollingRealizedVol(window_sec=30)   # 参数无法覆盖，测试困难
 ```
 
 好处：
-1. 单元测试可以直接传入 mock 实现，无需启动真实交易所连接
-2. 切换交易所（Binance → OKX）只需在 `cmd/main.py` 换一行构造代码
-3. 未来接入依赖注入框架（如 `wire`/`lagom`）时无需改动业务代码
+1. 单元测试可以直接传入 mock / stub，无需启动真实交易所连接。
+2. 切换交易所（Binance → OKX）只需在 service 层换一行构造代码，biz 完全不动。
+3. 未来接入依赖注入框架（如 `lagom`）时无需改动业务代码。
