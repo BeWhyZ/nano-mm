@@ -36,21 +36,27 @@ _RST   = "\033[0m"  if _TTY else ""
 _ob_lines = 0
 
 
+def _fmt_side(levels: Any) -> str:
+    if not levels:
+        return "  -  "
+    prices = "/".join(f"{q.price:.4f}" for q in levels)
+    total = sum(q.size for q in levels)
+    return f"[{len(levels)}]{prices} Σ{total:g}"
+
+
 def _on_quote(s: Any) -> None:
-    if s.bid is None and s.ask is None:
+    if not s.bids and not s.asks:
         line = (
             f"{s.symbol:<10} mid={s.mid:>10.4f}  "
             f"calibrating s={s.sigma:.4f} A={s.A:.2f} k={s.k:.4f}"
         )
     else:
-        bid_str = f"{s.bid.price:.4f}x{s.bid.size:g}" if s.bid else "  -  "
-        ask_str = f"{s.ask.price:.4f}x{s.ask.size:g}" if s.ask else "  -  "
         line = (
             f"{s.symbol:<10} mid={s.mid:>10.4f}  "
-            f"bid={bid_str:<22} ask={ask_str:<22}  "
+            f"bid={_fmt_side(s.bids):<48} ask={_fmt_side(s.asks):<48}  "
             f"s={s.sigma:.4f} A={s.A:.1f} k={s.k:.4f} q={s.q_norm:+.2f}"
         )
-    print("\r" + line.ljust(140), end="", flush=True)
+    print("\r" + line.ljust(180), end="", flush=True)
 
 
 def _print_book(snap: Any, depth: int) -> None:
@@ -86,7 +92,7 @@ _DEBUG_DEPTH = 10
 
 
 async def run_debug(cfg: config.Config, symbol: str) -> None:
-    from data.orderbook import make_orderbook_tracker
+    from biz.repo import make_orderbook_tracker
     from pkg.constant import Exchange
 
     lg = logger.get_logger("mm.debug")

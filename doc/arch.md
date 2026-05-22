@@ -36,15 +36,16 @@ pkg/
 
 ```
 cmd
- └─► server.MMServer(cfg, session, ...)   # 只组装，只启动
-      └─► service.FairValueService(...)   # 暴露 API，管理订阅生命周期
-      │    └─► data.make_orderbook_tracker(exchange, ...)  # 具体 WS 连接
-      │    └─► biz.FairValueEngine(...)                    # 公平价计算
+ └─► server.MMServer(cfg, session, ...)   # 组装所有层，创建并注入 data 依赖
+      │    ├─► data.make_orderbook_tracker(exchange, ...)  # 具体 WS 连接（在此创建）
+      │    └─► data.BinanceSpotAggTradeTracker(...)        # 成交流（在此创建）
       │
-      └─► server.GltSpreadServer(fair_svc, ...)
-           └─► fair_svc.register_book_listener(...)  # 复用已有订阅
-           └─► data.BinanceSpotAggTradeTracker(...)  # 独立成交流
-           └─► biz.GltSpreadEngine(...)              # GLT 报价计算
+      └─► service.FairValueService(book_repos, ...)   # 只持有 biz 层对象
+      │    └─► biz.FairValueEngine(book_repo, ...)    # 公平价计算（接受 OrderBookRepo 接口）
+      │
+      └─► server.GltSpreadServer(fair_svc, agg_trade_repo, ...)
+           └─► fair_svc.register_book_listener(...)        # 复用已有订阅
+           └─► biz.GltSpreadEngine(agg_trade_repo, ...)    # GLT 报价计算（接受 AggTradeRepo 接口）
 ```
 
 ---
@@ -68,18 +69,23 @@ async def main(symbol: str) -> None:
 
 ---
 
-### `server` — 生命周期管理
+### `server` — 生命周期管理 + 依赖组装根
 
-- 负责**创建并连线** service 层对象，启动所有异步任务，处理 SIGTERM/Ctrl-C。
+- 负责**创建 data 层对象**，将其注入 service/biz 层，启动所有异步任务，处理 SIGTERM/Ctrl-C。
+- 是整个系统的**组合根（composition root）**：唯一知道"用哪个具体 data 实现"的地方。
 - **不含**定价、风控、业务决策逻辑。
-- 可以 import `service`，不应直接 import `biz/usecase` 或 `data`。
+- 可以 import `service` 和 `data`，不应直接 import `biz/usecase`。
 
 ```python
 # server/mm_server.py
 class MMServer:
     def __init__(self, symbol, session, cfg, on_quote, lg, ...):
-        self._fair_svc = FairValueService(symbol, exchanges, session, cfg.pricing_engine, lg)
-        self._glt = GltSpreadServer(symbol, self._fair_svc, session, cfg.spread_engine, on_quote, lg)
+        # 在 server 层创建 data 对象，向下注入
+        book_repos = {ex: make_orderbook_tracker(ex, symbol, session) for ex in exchanges}
+        agg_trade_repo = BinanceSpotAggTradeTracker(symbol, session)
+
+        self._fair_svc = FairValueService(symbol, book_repos, cfg.pricing_engine, lg)
+        self._glt = GltSpreadServer(symbol, self._fair_svc, agg_trade_repo, cfg.spread_engine, on_quote, lg)
 
     async def run(self) -> None:
         await asyncio.gather(self._fair_svc.run(), self._glt.run())
@@ -87,25 +93,26 @@ class MMServer:
 
 ---
 
-### `service` — API 定义层（核心新增）
+### `service` — API 定义层
 
 - **对外**：定义稳定的业务接口（如 `get_fair_price()`），供 server 层消费。
-- **对内**：调用 `biz/usecase` 中的 UC 实现业务逻辑；管理 `data` 层 trackers 的生命周期。
-- 是 `biz` 与 `data` 的组合根（composition root）：它知道"用哪个交易所的哪个 UC 来回答这个问题"。
+- **对内**：**只调用 `biz/usecase`**，不直接 import 或创建任何 `data` 层对象。
+- 接收的 data 依赖已由 server 层创建并注入（类型为 `biz/repo` 中定义的抽象接口）。
 
 ```python
 # service/fair_value_service.py
 class FairValueService:
     """
     对外接口：
-      get_fair_price(exchange?)          -> FairPriceState | None
+      get_fair_price(exchange?)             -> FairPriceState | None
       register_book_listener(exchange, cb)  供 GLT 等复用订阅，避免重复 WS 连接
 
     内部：
-      为每个 exchange 创建 OrderBookRepo (data) + FairValueEngine (biz/usecase)
+      接收 book_repos: dict[Exchange, OrderBookRepo]（由 server 注入）
+      为每个 exchange 创建 FairValueEngine(biz/usecase)，将 repo 传入
       WS 回调 -> engine.on_tick() -> 通知所有 listener
     """
-    def __init__(self, symbol, exchanges: list[Exchange], session, cfg, lg): ...
+    def __init__(self, symbol, book_repos: dict[Exchange, OrderBookRepo], cfg, lg): ...
     def get_fair_price(self, exchange=None) -> FairPriceState | None: ...
     def register_book_listener(self, exchange, cb) -> None: ...
     async def run(self) -> None: ...
@@ -158,14 +165,16 @@ class GltSpreadEngine:
 
 ```
 cmd      ──────────►  server, pkg
-server   ──────────►  service, pkg
-service  ──────────►  biz, data, pkg
+server   ──────────►  service, data, pkg   # 唯一可以 import data 的上层
+service  ──────────►  biz, pkg             # 严禁直接 import data
 data     ──────────►  biz/repo, pkg
-biz      ──────────►  pkg          # 严禁 import data
+biz      ──────────►  pkg                  # 严禁 import data
 ```
 
-> **核心约束**：`biz` 永远不 import `data`，只依赖自己定义的抽象接口。
-> `cmd` 永远不 import `service`、`biz`、`data`，只调用 `server`。
+> **核心约束一**：`biz` 永远不 import `data`，只依赖自己定义的抽象接口。
+> **核心约束二**：`service` 永远不 import `data`，所需的 data 对象由 `server` 创建后以 `biz/repo` 接口类型注入。
+> **核心约束三**：`cmd` 永远不 import `service`、`biz`、`data`，只调用 `server`。
+> `server` 是系统的组合根（composition root），是唯一知道具体 data 实现的地方。
 
 ---
 

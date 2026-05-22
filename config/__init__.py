@@ -66,6 +66,18 @@ class SpreadConfig(msgspec.Struct, frozen=True):
     # 0.0 = no rounding (caller is responsible).
     price_tick: float = 0.0
 
+    # Ladder shape: how single GLT (δ_b, δ_a) is expanded into N levels per side.
+    ladder_n_levels: int = 3
+    # Δ between adjacent levels = ladder_delta_coef · u, where u is the GLT
+    # dispersion unit. Auto-scales with σ/k/A.
+    ladder_delta_coef: float = 0.5
+    # Per-level size weight; len must equal ladder_n_levels, sum to 1.0.
+    # Default is internal-thin / external-thick (institutional shape).
+    ladder_weights: tuple[float, ...] = (0.15, 0.30, 0.55)
+    # Max outer levels dropped on the hit side when |q_norm| = 1.
+    # 0 disables ladder-level inventory asymmetry (price skew remains via GLT).
+    ladder_n_shrink: int = 2
+
 
 class Config(msgspec.Struct, frozen=True):
     log: LogConfig = msgspec.field(default_factory=LogConfig)

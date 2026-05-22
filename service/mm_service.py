@@ -56,7 +56,6 @@ class MMService:
         self._fair_engine = FairValueEngine(symbol, lg=self.lg, micro_k=int(pricing_cfg.micro_k))
         self._glt_engine = GltSpreadEngine(symbol, spread_cfg, lg=self.lg)
 
-        # data layer
         self._book_tracker = make_orderbook_tracker(
             exchange=exchange,
             symbol=symbol,

@@ -21,23 +21,29 @@ from pkg import logger
 from server.mm_server import MMServer
 
 
+def _fmt_side(levels: Any) -> str:
+    if not levels:
+        return "  -  "
+    prices = "/".join(f"{q.price:.4f}" for q in levels)
+    total = sum(q.size for q in levels)
+    return f"[{len(levels)}]{prices} Σ{total:g}"
+
+
 def _fmt_quote(s: Any) -> str:
-    if s.bid is None and s.ask is None:
+    if not s.bids and not s.asks:
         return (
             f"{s.symbol:<10} mid={s.mid:>10.4f}  "
             f"calibrating s={s.sigma:.4f} A={s.A:.2f} k={s.k:.4f}"
         )
-    bid_str = f"{s.bid.price:.4f}x{s.bid.size:g}" if s.bid else "  -  "
-    ask_str = f"{s.ask.price:.4f}x{s.ask.size:g}" if s.ask else "  -  "
     return (
         f"{s.symbol:<10} mid={s.mid:>10.4f}  "
-        f"bid={bid_str:<22} ask={ask_str:<22}  "
+        f"bid={_fmt_side(s.bids):<48} ask={_fmt_side(s.asks):<48}  "
         f"s={s.sigma:.4f} A={s.A:.1f} k={s.k:.4f} q={s.q_norm:+.2f}"
     )
 
 
 def _print_state(s: Any) -> None:
-    print("\r" + _fmt_quote(s).ljust(140), end="", flush=True)
+    print("\r" + _fmt_quote(s).ljust(180), end="", flush=True)
 
 
 async def main(symbol: str) -> None:
