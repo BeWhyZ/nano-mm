@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
+from biz.domain.book import OrderBookSnapshot
 from biz.domain.order import Order, OrderSide, OrderType
 
 
@@ -14,8 +17,13 @@ class ExchangeRepo(ABC):
         price: float,
         qty: float,
         post_only: bool = True,
+        snap: OrderBookSnapshot | None = None,
     ) -> None:
-        """Submit a limit order. Raises on network error."""
+        """Submit a limit order. Raises on network error.
+
+        snap: the book snapshot used to compute this quote (paper impl uses it
+        for the post-only cross-check; live impls ignore it — venue enforces server-side).
+        """
 
     @abstractmethod
     async def cancel_order(self, client_order_id: str, symbol: str) -> None:

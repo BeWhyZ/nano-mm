@@ -140,6 +140,14 @@ class GltSpreadEngine:
         delta_b, delta_a = quotes(params, q_lot)
         u = inventory_skew_unit(params)
 
+        # Spread floor: clamp δ so neither side quotes tighter than the
+        # adverse-selection band.  Applied before ladder expansion so every
+        # level inherits the floor.
+        if self._cfg.spread_floor_bps > 0.0:
+            floor = self._cfg.spread_floor_bps * mid / 2.0 / 1e4
+            delta_b = max(delta_b, floor)
+            delta_a = max(delta_a, floor)
+
         # Negative δ means the model wants to cross — a sign that γ/Q_max are
         # mis-tuned for current σ. Suppress the offending side and log; the
         # other side may still be valid.

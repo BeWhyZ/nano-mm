@@ -89,6 +89,7 @@ config/local*.json
 
 # Logs & data
 log/
+logs/
 *.log
 *.csv
 *.parquet

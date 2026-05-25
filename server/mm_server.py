@@ -13,6 +13,7 @@ import aiohttp
 import structlog
 
 from biz.domain.quote import QuoteState
+from biz.repo.archive import ArchiveRepo
 from config import Config
 from pkg.constant import Exchange
 from service.mm_service import MMService
@@ -33,10 +34,13 @@ class MMServer:
         on_quote: Callable[[QuoteState], None],
         lg: structlog.stdlib.BoundLogger,
         exchange: Exchange | None = None,
+        reference_exchange: Exchange | None = None,
+        archive: ArchiveRepo | None = None,
         proxy: str | None = None,
     ) -> None:
         self.lg = lg.bind(component="mm_server", symbol=symbol.upper())
-        _exchange = exchange or Exchange.BINANCE_SPOT
+        _exchange = exchange or Exchange(cfg.venues.target)
+        _ref_exchange = reference_exchange or Exchange(cfg.venues.reference)
 
         self._svc = MMService(
             symbol=symbol,
@@ -45,6 +49,8 @@ class MMServer:
             pricing_cfg=cfg.pricing_engine,
             spread_cfg=cfg.spread_engine,
             lg=self.lg,
+            reference_exchange=_ref_exchange if _ref_exchange != _exchange else None,
+            archive=archive,
             proxy=proxy,
         )
         self._svc.register_quote_listener(on_quote)

@@ -11,6 +11,10 @@ dependencies = [
     "structlog>=24.1",
     "uvloop>=0.20; sys_platform != 'win32'",
     "pyyaml>=6.0",
+    "duckdb>=1.1",
+    "polars>=1.0",
+    "pyarrow>=17.0",
+    "numpy>=2.4.6",
 ]
 
 [dependency-groups]

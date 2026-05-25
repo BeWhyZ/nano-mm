@@ -114,6 +114,27 @@ class IntensityCalibrator:
             ys.append(math.log(rate))
 
         if len(xs) < self._min_filled_bins:
+            # Tight-spread fallback: fires ONLY when the 90th-percentile trade δ
+            # falls below the lowest threshold (market is a 1-tick spread, e.g.
+            # BTC/USDT spot where all aggTrades execute at half-spread ≈ 0.007 bps
+            # while the smallest threshold is 0.5 bps).  Other failure reasons
+            # (positive slope, insufficient data, noisy distribution) are left as
+            # None so the engine stays in its "no quote" safe state.
+            p90_bps = deltas_bps[int(0.9 * len(deltas_bps))]
+            tight_spread = p90_bps < self._thresholds_bps[0]
+            if tight_spread and len(deltas_bps) >= self._min_trades and T_obs > 0:
+                median_bps = deltas_bps[len(deltas_bps) // 2]
+                if median_bps > 1e-9:
+                    A_est = len(deltas_bps) / T_obs
+                    k_bps_est = math.log(2.0) / median_bps
+                    k_price_est = k_bps_est * 1e4 / mid_avg
+                    if (
+                        A_est > 0
+                        and k_price_est > 0
+                        and math.isfinite(A_est)
+                        and math.isfinite(k_price_est)
+                    ):
+                        return A_est, k_price_est
             return None
 
         fit = _ols(xs, ys)

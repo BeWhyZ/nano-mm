@@ -66,6 +66,11 @@ class SpreadConfig(msgspec.Struct, frozen=True):
     # 0.0 = no rounding (caller is responsible).
     price_tick: float = 0.0
 
+    # Half-spread minimum floor (bps).  Prevents GLT from quoting inside the
+    # adverse-selection band.  Applied to both δ_b and δ_a after GLT output.
+    # 0.0 = disabled.  Recommended starting value: 0.75 (= 1.5 bps full spread).
+    spread_floor_bps: float = 0.0
+
     # Ladder shape: how single GLT (δ_b, δ_a) is expanded into N levels per side.
     ladder_n_levels: int = 3
     # Δ between adjacent levels = ladder_delta_coef · u, where u is the GLT
@@ -79,11 +84,48 @@ class SpreadConfig(msgspec.Struct, frozen=True):
     ladder_n_shrink: int = 2
 
 
+class VenuesConfig(msgspec.Struct, frozen=True):
+    # target: the exchange where you place/cancel orders.
+    # reference: the exchange you read fair price from (may equal target for self-quoting).
+    target: str = "binance_spot"
+    reference: str = "binance_spot"
+
+
+class ArchiveConfig(msgspec.Struct, frozen=True):
+    enabled: bool = True
+    base_dir: str = "logs"
+    # Parquet: flush after this many rows or flush_interval_s seconds (whichever first).
+    parquet_flush_rows: int = 1000
+    parquet_flush_interval_s: float = 5.0
+    # SQLite: flush after this many statements or flush_interval_s seconds.
+    sqlite_flush_rows: int = 100
+    sqlite_flush_interval_s: float = 1.0
+
+
+class PaperConfig(msgspec.Struct, frozen=True):
+    # Minimum qty increment (asset-specific; BTC default).
+    qty_step: float = 0.00001
+    # Flat maker fee in bps; set negative for a rebate scenario (0 = no fees).
+    maker_fee_bps: float = 0.0
+    # Starting normalized inventory fed to GLT on session start.
+    initial_q_norm: float = 0.0
+    # Force-cancel any resting quote older than this many ms on each book tick.
+    # 0 = disabled.  Recommended: 2000 to prune the long tail of stale quotes.
+    max_quote_age_ms: float = 0.0
+    # In cross-venue mode, cancel the adverse side immediately on a reference
+    # aggTrade.  0 = disabled (all trades trigger); positive = min notional USD
+    # threshold to filter noise (e.g. 5000 to require ≥ $5k trade).
+    ref_trade_cancel_min_notional: float = 0.0
+
+
 class Config(msgspec.Struct, frozen=True):
     log: LogConfig = msgspec.field(default_factory=LogConfig)
     net: NetConfig = msgspec.field(default_factory=NetConfig)
     pricing_engine: PricingConfig = msgspec.field(default_factory=PricingConfig)
     spread_engine: SpreadConfig = msgspec.field(default_factory=SpreadConfig)
+    venues: VenuesConfig = msgspec.field(default_factory=VenuesConfig)
+    archive: ArchiveConfig = msgspec.field(default_factory=ArchiveConfig)
+    paper: PaperConfig = msgspec.field(default_factory=PaperConfig)
 
 
 def load(path: str | Path = "etc/nano-mm.yaml") -> Config:

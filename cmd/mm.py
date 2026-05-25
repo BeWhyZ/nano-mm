@@ -117,9 +117,20 @@ async def run_debug(cfg: config.Config, symbol: str) -> None:
 
 
 async def run_mm(symbol: str, cfg: config.Config) -> None:
+    from service.archive_service import ArchiveService
+
     lg = logger.get_logger("mm")
     lg.info("mm_start", symbol=symbol)
     print(f"Starting MM for {symbol} -- Ctrl-C to stop")
+
+    archive_svc = ArchiveService(
+        symbol=symbol,
+        venues_cfg=cfg.venues,
+        archive_cfg=cfg.archive,
+        full_config=cfg,
+        lg=lg,
+    )
+    await archive_svc.start()
 
     async with aiohttp.ClientSession() as session:
         srv = MMServer(
@@ -128,6 +139,7 @@ async def run_mm(symbol: str, cfg: config.Config) -> None:
             cfg=cfg,
             on_quote=_on_quote,
             lg=lg,
+            archive=archive_svc.manager,
             proxy=cfg.net.http_proxy,
         )
         try:
@@ -136,6 +148,8 @@ async def run_mm(symbol: str, cfg: config.Config) -> None:
             pass
         finally:
             print()
+
+    await archive_svc.stop()
 
 
 if __name__ == "__main__":

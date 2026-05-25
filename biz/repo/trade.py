@@ -34,5 +34,11 @@ def make_trade_tracker(
             return BinanceSpotAggTradeTracker(
                 symbol=symbol, lg=lg, on_trade=on_trade, proxy=proxy,
             )
+        case Exchange.BYBIT_SPOT:
+            from data.trade.bybit_spot import BybitSpotTradeTracker
+
+            return BybitSpotTradeTracker(
+                symbol=symbol, lg=lg, on_trade=on_trade, proxy=proxy,
+            )
         case _:
             raise ValueError(f"No trade tracker for exchange: {exchange!r}")
