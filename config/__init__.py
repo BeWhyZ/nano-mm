@@ -83,6 +83,22 @@ class SpreadConfig(msgspec.Struct, frozen=True):
     # 0 disables ladder-level inventory asymmetry (price skew remains via GLT).
     ladder_n_shrink: int = 2
 
+    # ── Re-quote hysteresis (Ex-4 queue-value protection) ────────────────
+    # Each fresh L2 tick recomputes the GLT ladder.  If we publish a new
+    # QuoteState every tick, QuoteDiffer cancels/replaces every resting order
+    # whenever the quantized ladder shifts by even one tick — destroying queue
+    # position.  These thresholds suppress emit unless something meaningful
+    # changes.  See CLAUDE.md Ex-4 ("公平价移动 > 1 tick 或库存超阈值才动").
+    #
+    # Emit (replace self._state with a fresh QuoteState) iff:
+    #   - first non-empty state, OR ladder shape (which sides are quoted) changes
+    #   - |Δinner_bid| OR |Δinner_ask| > requote_inner_move_ticks × price_tick
+    #   - |Δq_norm| ≥ requote_q_norm_threshold
+    #   - elapsed since last emit ≥ requote_max_age_ms (heartbeat)
+    requote_inner_move_ticks: int = 1
+    requote_q_norm_threshold: float = 0.05
+    requote_max_age_ms: float = 1000.0
+
 
 class VenuesConfig(msgspec.Struct, frozen=True):
     # target: the exchange where you place/cancel orders.

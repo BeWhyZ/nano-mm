@@ -70,6 +70,12 @@ class GltSpreadEngine:
         self._latest_mid: float | None = None
         self._state: QuoteState | None = None
 
+        # Re-quote hysteresis anchors (set on each emit; None until first emit).
+        self._emit_anchor_q_norm: float = 0.0
+        self._emit_anchor_ts_ns: int = 0
+        self._emit_bid_inner_px: float | None = None
+        self._emit_ask_inner_px: float | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -182,6 +188,13 @@ class GltSpreadEngine:
             if ask_active else ()
         )
 
+        # Hysteresis gate: only publish a new QuoteState when something
+        # meaningful changed.  Otherwise leave self._state untouched so
+        # downstream QuoteDiffer's exact-match-after-quantize keep-logic
+        # preserves queue position.
+        if not self._should_reemit(bids, asks, ts_ns):
+            return
+
         self._state = QuoteState(
             symbol=self._symbol,
             venue=venue,
@@ -195,6 +208,7 @@ class GltSpreadEngine:
             q_norm=self._q_norm,
             ts_ns=ts_ns,
         )
+        self._update_emit_anchors(bids, asks, ts_ns)
 
         self.lg.debug(
             "glt_quote",
@@ -220,6 +234,77 @@ class GltSpreadEngine:
             sigma=sigma, A=A, k=k, gamma=self._cfg.gamma,
             q_norm=self._q_norm, ts_ns=ts_ns,
         )
+
+    def _should_reemit(
+        self,
+        new_bids: tuple[Quote, ...],
+        new_asks: tuple[Quote, ...],
+        ts_ns: int,
+    ) -> bool:
+        """Decide whether the just-computed ladder should overwrite self._state.
+
+        Returns True when the change is material enough to be worth the queue-
+        position cost of canceling and re-placing.  See SpreadConfig docstring
+        for the exact paths.
+        """
+        prev = self._state
+
+        # Path 1: first non-empty emit (cold start or coming out of empty state).
+        if prev is None or (not prev.bids and not prev.asks):
+            return True
+
+        # Path 2: ladder shape change — either side flipped between empty and
+        # populated (e.g. q_hard_cap triggered or released).
+        if bool(prev.bids) != bool(new_bids) or bool(prev.asks) != bool(new_asks):
+            return True
+
+        # Path 3: heartbeat — force refresh after max_age even when bands hold,
+        # so σ/A/k drift eventually propagates into prices.
+        if (
+            self._cfg.requote_max_age_ms > 0.0
+            and ts_ns - self._emit_anchor_ts_ns
+            >= self._cfg.requote_max_age_ms * 1_000_000
+        ):
+            return True
+
+        # Path 4: inventory drift past threshold (skew became materially different).
+        if (
+            abs(self._q_norm - self._emit_anchor_q_norm)
+            >= self._cfg.requote_q_norm_threshold
+        ):
+            return True
+
+        # Path 5: inner price drift > N ticks on either side.  Compare integer
+        # tick counts to be robust to float-point noise from `_round_up/_down`
+        # (e.g. 49998.13 may be stored as 49998.130000000005).
+        tick = self._cfg.price_tick
+        threshold_ticks = self._cfg.requote_inner_move_ticks
+        if tick > 0.0 and threshold_ticks > 0:
+            if (
+                new_bids and self._emit_bid_inner_px is not None
+                and round(abs(new_bids[0].price - self._emit_bid_inner_px) / tick)
+                > threshold_ticks
+            ):
+                return True
+            if (
+                new_asks and self._emit_ask_inner_px is not None
+                and round(abs(new_asks[0].price - self._emit_ask_inner_px) / tick)
+                > threshold_ticks
+            ):
+                return True
+
+        return False
+
+    def _update_emit_anchors(
+        self,
+        bids: tuple[Quote, ...],
+        asks: tuple[Quote, ...],
+        ts_ns: int,
+    ) -> None:
+        self._emit_anchor_q_norm = self._q_norm
+        self._emit_anchor_ts_ns = ts_ns
+        self._emit_bid_inner_px = bids[0].price if bids else None
+        self._emit_ask_inner_px = asks[0].price if asks else None
 
     def _build_bid_quotes(
         self, mid: float, levels, base_size: float,
